@@ -137,6 +137,16 @@ canvas { display: block; }
   position: absolute; bottom: 65px; left: 30px;
   color: rgba(255,255,255,0.3); font-size: 10px; line-height: 1.5;
 }
+
+#audio-toggle {
+  position: absolute; top: 30px; left: 30px;
+  color: rgba(255,255,255,0.5); font-size: 13px;
+  cursor: pointer; pointer-events: all;
+  background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.15);
+  border-radius: 6px; padding: 4px 10px;
+  transition: background 0.2s;
+}
+#audio-toggle:hover { background: rgba(255,255,255,0.15); }
 </style>
 </head>
 <body>
@@ -154,6 +164,7 @@ canvas { display: block; }
     <p><span class="key">F</span> &mdash; Fire flares</p>
     <p><span class="key">C</span> &mdash; Toggle camera view</p>
     <p><span class="key">R</span> &mdash; Reset plane (if crashed)</p>
+    <p><span class="key">M</span> &mdash; Toggle music / sound</p>
   </div>
   <button id="start-btn" onclick="startGame()">TAKE OFF</button>
 </div>
@@ -174,6 +185,7 @@ canvas { display: block; }
   <div id="warning"></div>
   <canvas id="minimap"></canvas>
   <div id="control-hint"></div>
+  <div id="audio-toggle" onclick="toggleAudio()">Sound: OFF [M]</div>
 </div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
@@ -211,6 +223,25 @@ const CHUNK_SEGMENTS = 80;
 const VIEW_DISTANCE = 3; // chunks in each direction
 const terrainChunks = new Map();
 const vegetationChunks = new Map();
+
+// Async chunk generation queue (prevents frame stuttering)
+const chunkQueue = [];
+const MAX_CHUNKS_PER_FRAME = 1; // only build 1 chunk per frame
+const pendingChunkKeys = new Set();
+
+// Terrain height cache for vegetation placement
+const heightCache = new Map();
+const HEIGHT_CACHE_MAX = 50000;
+
+// Audio
+let audioCtx = null;
+let audioEnabled = false;
+let masterGain = null;
+let engineOsc1 = null, engineOsc2 = null, engineGain = null;
+let windNoise = null, windGain = null, windFilter = null;
+let musicGain = null;
+let musicNotes = [];
+let nextMusicTime = 0;
 
 // Seeded random for consistent terrain
 function seededRandom(x, z) {
@@ -379,8 +410,8 @@ function init() {
   createWindParticles();
   createLighthouses();
 
-  // Generate initial terrain chunks
-  updateTerrainChunks(airplane_state.position.x, airplane_state.position.z);
+  // Generate initial terrain chunks synchronously (so player has ground)
+  updateTerrainChunks(airplane_state.position.x, airplane_state.position.z, true);
 
   // Events - keyboard only
   document.addEventListener('keydown', e => {
@@ -473,24 +504,45 @@ function chunkKey(cx, cz) {
   return cx + ',' + cz;
 }
 
-function updateTerrainChunks(px, pz) {
+function updateTerrainChunks(px, pz, forceSync) {
   const cx = Math.floor(px / CHUNK_SIZE);
   const cz = Math.floor(pz / CHUNK_SIZE);
 
   const activeKeys = new Set();
 
+  // Build sorted list by distance to player chunk (closer = higher priority)
+  const needed = [];
   for (let dx = -VIEW_DISTANCE; dx <= VIEW_DISTANCE; dx++) {
     for (let dz = -VIEW_DISTANCE; dz <= VIEW_DISTANCE; dz++) {
       const kcx = cx + dx, kcz = cz + dz;
       const key = chunkKey(kcx, kcz);
       activeKeys.add(key);
 
-      if (!terrainChunks.has(key)) {
-        createTerrainChunk(kcx, kcz);
+      const needsTerrain = !terrainChunks.has(key);
+      const needsVeg = !vegetationChunks.has(key);
+      if (needsTerrain || needsVeg) {
+        if (!pendingChunkKeys.has(key)) {
+          const dist = dx * dx + dz * dz;
+          needed.push({ cx: kcx, cz: kcz, key, needsTerrain, needsVeg, dist });
+        }
       }
-      if (!vegetationChunks.has(key)) {
-        createVegetationChunk(kcx, kcz);
-      }
+    }
+  }
+
+  // Sort by distance (closest first)
+  needed.sort((a, b) => a.dist - b.dist);
+
+  if (forceSync) {
+    // Initial load: build everything now
+    for (const item of needed) {
+      if (item.needsTerrain) createTerrainChunk(item.cx, item.cz);
+      if (item.needsVeg) createVegetationChunk(item.cx, item.cz);
+    }
+  } else {
+    // Queue for async processing
+    for (const item of needed) {
+      pendingChunkKeys.add(item.key);
+      chunkQueue.push(item);
     }
   }
 
@@ -506,7 +558,6 @@ function updateTerrainChunks(px, pz) {
   for (const [key, group] of vegetationChunks) {
     if (!activeKeys.has(key)) {
       scene.remove(group);
-      // Dispose children
       group.traverse(child => {
         if (child.geometry) child.geometry.dispose();
         if (child.material) {
@@ -516,6 +567,29 @@ function updateTerrainChunks(px, pz) {
       });
       vegetationChunks.delete(key);
     }
+  }
+
+  // Trim height cache periodically
+  if (heightCache.size > HEIGHT_CACHE_MAX) {
+    heightCache.clear();
+  }
+}
+
+// Process chunk queue - called each frame, builds at most MAX_CHUNKS_PER_FRAME
+function processChunkQueue() {
+  let built = 0;
+  while (chunkQueue.length > 0 && built < MAX_CHUNKS_PER_FRAME) {
+    const item = chunkQueue.shift();
+    pendingChunkKeys.delete(item.key);
+
+    // Skip if chunk was already built or is no longer needed
+    if (item.needsTerrain && !terrainChunks.has(item.key)) {
+      createTerrainChunk(item.cx, item.cz);
+    }
+    if (item.needsVeg && !vegetationChunks.has(item.key)) {
+      createVegetationChunk(item.cx, item.cz);
+    }
+    built++;
   }
 }
 
@@ -612,12 +686,24 @@ const treeTrunkGeo = new THREE.CylinderGeometry(0.3, 0.5, 1, 5);
 const bushGeo = new THREE.SphereGeometry(1, 6, 5);
 const tallBushGeo = new THREE.DodecahedronGeometry(1, 0);
 
+// Cached height lookup - rounds coords to reduce cache misses
+function getCachedHeight(x, z) {
+  const rx = Math.round(x * 0.5) * 2;
+  const rz = Math.round(z * 0.5) * 2;
+  const key = rx + ',' + rz;
+  let h = heightCache.get(key);
+  if (h === undefined) {
+    h = getTerrainHeight(rx, rz);
+    heightCache.set(key, h);
+  }
+  return h;
+}
+
 function createVegetationChunk(cx, cz) {
   const group = new THREE.Group();
   const offsetX = cx * CHUNK_SIZE;
   const offsetZ = cz * CHUNK_SIZE;
 
-  // Skip vegetation very near runway origin for performance
   const chunkCenterX = offsetX + CHUNK_SIZE / 2;
   const chunkCenterZ = offsetZ + CHUNK_SIZE / 2;
 
@@ -633,7 +719,7 @@ function createVegetationChunk(cx, cz) {
     const distFromRunway = Math.sqrt(wx * wx + Math.pow(Math.max(0, Math.abs(wz - 50) - 160), 2));
     if (distFromRunway < 80) continue;
 
-    const h = getTerrainHeight(wx, wz);
+    const h = getCachedHeight(wx, wz);
     if (h < 3 || h > 120) continue; // Only grassy areas
 
     const tree = new THREE.Group();
@@ -675,7 +761,7 @@ function createVegetationChunk(cx, cz) {
     const distFromRunway = Math.sqrt(wx * wx + Math.pow(Math.max(0, Math.abs(wz - 50) - 160), 2));
     if (distFromRunway < 70) continue;
 
-    const h = getTerrainHeight(wx, wz);
+    const h = getCachedHeight(wx, wz);
     if (h < 1 || h > 90) continue;
 
     const rng = seededRandom(wx * 5.1, wz * 3.7);
@@ -706,7 +792,7 @@ function createVegetationChunk(cx, cz) {
     const lz = seededRandom(cx * 3000 + i * 43, cz * 3000 + i * 47) * CHUNK_SIZE;
     const wx = offsetX + lx;
     const wz = offsetZ + lz;
-    const h = getTerrainHeight(wx, wz);
+    const h = getCachedHeight(wx, wz);
     if (h < 40 || h > 250) continue;
 
     const rng = seededRandom(wx * 7.3, wz * 9.1);
@@ -1447,6 +1533,311 @@ function updateMinimap() {
 }
 
 // ============================================================
+// AUDIO SYSTEM (Web Audio API)
+// ============================================================
+
+function initAudio() {
+  if (audioCtx) return;
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+
+  masterGain = audioCtx.createGain();
+  masterGain.gain.value = 0.5;
+  masterGain.connect(audioCtx.destination);
+
+  // --- Engine Sound (layered oscillators) ---
+  engineGain = audioCtx.createGain();
+  engineGain.gain.value = 0;
+  engineGain.connect(masterGain);
+
+  // Main engine tone
+  engineOsc1 = audioCtx.createOscillator();
+  engineOsc1.type = 'sawtooth';
+  engineOsc1.frequency.value = 80;
+  const engineFilter1 = audioCtx.createBiquadFilter();
+  engineFilter1.type = 'lowpass';
+  engineFilter1.frequency.value = 300;
+  engineFilter1.Q.value = 2;
+  engineOsc1.connect(engineFilter1);
+  engineFilter1.connect(engineGain);
+  engineOsc1.start();
+  engineOsc1._filter = engineFilter1;
+
+  // Engine harmonic
+  engineOsc2 = audioCtx.createOscillator();
+  engineOsc2.type = 'square';
+  engineOsc2.frequency.value = 160;
+  const engineFilter2 = audioCtx.createBiquadFilter();
+  engineFilter2.type = 'lowpass';
+  engineFilter2.frequency.value = 400;
+  const eng2Gain = audioCtx.createGain();
+  eng2Gain.gain.value = 0.3;
+  engineOsc2.connect(engineFilter2);
+  engineFilter2.connect(eng2Gain);
+  eng2Gain.connect(engineGain);
+  engineOsc2.start();
+  engineOsc2._filter = engineFilter2;
+
+  // --- Wind Noise ---
+  windGain = audioCtx.createGain();
+  windGain.gain.value = 0;
+  windGain.connect(masterGain);
+
+  windFilter = audioCtx.createBiquadFilter();
+  windFilter.type = 'bandpass';
+  windFilter.frequency.value = 800;
+  windFilter.Q.value = 0.5;
+  windFilter.connect(windGain);
+
+  // Create wind noise buffer
+  const bufferSize = audioCtx.sampleRate * 2;
+  const noiseBuffer = audioCtx.createBuffer(1, bufferSize, audioCtx.sampleRate);
+  const data = noiseBuffer.getChannelData(0);
+  for (let i = 0; i < bufferSize; i++) {
+    data[i] = (Math.random() * 2 - 1) * 0.7;
+  }
+  windNoise = audioCtx.createBufferSource();
+  windNoise.buffer = noiseBuffer;
+  windNoise.loop = true;
+  windNoise.connect(windFilter);
+  windNoise.start();
+
+  // --- Background Music ---
+  musicGain = audioCtx.createGain();
+  musicGain.gain.value = 0.12;
+  musicGain.connect(masterGain);
+
+  nextMusicTime = audioCtx.currentTime + 0.5;
+
+  audioEnabled = true;
+  document.getElementById('audio-toggle').textContent = 'Sound: ON [M]';
+}
+
+function toggleAudio() {
+  if (!audioCtx) {
+    initAudio();
+    return;
+  }
+  audioEnabled = !audioEnabled;
+  masterGain.gain.setTargetAtTime(audioEnabled ? 0.5 : 0, audioCtx.currentTime, 0.1);
+  document.getElementById('audio-toggle').textContent =
+    audioEnabled ? 'Sound: ON [M]' : 'Sound: OFF [M]';
+}
+
+function updateAudio(dt) {
+  if (!audioCtx || !audioEnabled) return;
+
+  const t = audioCtx.currentTime;
+
+  // --- Engine: pitch & volume from throttle/speed ---
+  const engineBase = 60 + throttle * 80 + speed * 0.5;
+  const engineVol = 0.05 + throttle * 0.35 + (boostActive ? 0.2 : 0);
+  engineOsc1.frequency.setTargetAtTime(engineBase, t, 0.05);
+  engineOsc2.frequency.setTargetAtTime(engineBase * 2.01, t, 0.05);
+  engineOsc1._filter.frequency.setTargetAtTime(200 + throttle * 500 + speed * 3, t, 0.05);
+  engineOsc2._filter.frequency.setTargetAtTime(300 + throttle * 400, t, 0.05);
+  engineGain.gain.setTargetAtTime(Math.min(0.6, engineVol), t, 0.05);
+
+  // --- Wind: volume & freq from speed/altitude ---
+  const windVol = Math.min(0.4, speed / 120);
+  const windFreq = 400 + speed * 8 + altitude * 0.3;
+  windGain.gain.setTargetAtTime(windVol, t, 0.1);
+  windFilter.frequency.setTargetAtTime(Math.min(4000, windFreq), t, 0.1);
+  windFilter.Q.setTargetAtTime(0.3 + speed / 200, t, 0.1);
+
+  // --- Ambient Music: gentle chord progression ---
+  if (t >= nextMusicTime) {
+    playMusicChord(t);
+  }
+}
+
+// Music chord system - slow ambient pads
+const musicChords = [
+  [261.63, 329.63, 392.00],   // C major
+  [293.66, 369.99, 440.00],   // D major
+  [220.00, 277.18, 329.63],   // A minor
+  [246.94, 311.13, 369.99],   // B minor
+  [261.63, 311.13, 392.00],   // C sus4
+  [220.00, 261.63, 329.63],   // Am
+  [196.00, 246.94, 293.66],   // G
+  [174.61, 220.00, 261.63],   // F
+];
+let musicChordIdx = 0;
+
+function playMusicChord(startTime) {
+  if (!audioCtx || !musicGain) return;
+
+  const chord = musicChords[musicChordIdx % musicChords.length];
+  musicChordIdx++;
+
+  const duration = 4.0 + Math.random() * 2;
+  const fadeIn = 1.0;
+  const fadeOut = 1.5;
+
+  for (const freq of chord) {
+    const osc = audioCtx.createOscillator();
+    osc.type = 'sine';
+    osc.frequency.value = freq / 2; // One octave lower for deep ambient
+
+    const oscGain = audioCtx.createGain();
+    oscGain.gain.setValueAtTime(0, startTime);
+    oscGain.gain.linearRampToValueAtTime(0.15, startTime + fadeIn);
+    oscGain.gain.setValueAtTime(0.15, startTime + duration - fadeOut);
+    oscGain.gain.linearRampToValueAtTime(0, startTime + duration);
+
+    // Soft filter
+    const filter = audioCtx.createBiquadFilter();
+    filter.type = 'lowpass';
+    filter.frequency.value = 600;
+
+    osc.connect(filter);
+    filter.connect(oscGain);
+    oscGain.connect(musicGain);
+
+    osc.start(startTime);
+    osc.stop(startTime + duration + 0.1);
+  }
+
+  nextMusicTime = startTime + duration - 1.0; // slight overlap
+}
+
+// --- Sound Effects ---
+
+function playCollectSound() {
+  if (!audioCtx) return;
+  const t = audioCtx.currentTime;
+
+  // Bright rising chime
+  [523.25, 659.25, 783.99, 1046.50].forEach((freq, i) => {
+    const osc = audioCtx.createOscillator();
+    osc.type = 'sine';
+    osc.frequency.value = freq;
+    const g = audioCtx.createGain();
+    g.gain.setValueAtTime(0, t + i * 0.06);
+    g.gain.linearRampToValueAtTime(0.25, t + i * 0.06 + 0.02);
+    g.gain.exponentialRampToValueAtTime(0.001, t + i * 0.06 + 0.4);
+    osc.connect(g);
+    g.connect(masterGain);
+    osc.start(t + i * 0.06);
+    osc.stop(t + i * 0.06 + 0.5);
+  });
+}
+
+function playCrashSound() {
+  if (!audioCtx) return;
+  const t = audioCtx.currentTime;
+
+  // Noise burst + low boom
+  const bufferSize = audioCtx.sampleRate * 1.5;
+  const buffer = audioCtx.createBuffer(1, bufferSize, audioCtx.sampleRate);
+  const data = buffer.getChannelData(0);
+  for (let i = 0; i < bufferSize; i++) {
+    data[i] = (Math.random() * 2 - 1) * Math.exp(-i / (audioCtx.sampleRate * 0.3));
+  }
+  const noise = audioCtx.createBufferSource();
+  noise.buffer = buffer;
+  const crashGain = audioCtx.createGain();
+  crashGain.gain.setValueAtTime(0.6, t);
+  crashGain.gain.exponentialRampToValueAtTime(0.001, t + 1.5);
+  const crashFilter = audioCtx.createBiquadFilter();
+  crashFilter.type = 'lowpass';
+  crashFilter.frequency.value = 500;
+  noise.connect(crashFilter);
+  crashFilter.connect(crashGain);
+  crashGain.connect(masterGain);
+  noise.start(t);
+  noise.stop(t + 1.5);
+
+  // Low boom
+  const boom = audioCtx.createOscillator();
+  boom.type = 'sine';
+  boom.frequency.setValueAtTime(80, t);
+  boom.frequency.exponentialRampToValueAtTime(20, t + 0.8);
+  const boomGain = audioCtx.createGain();
+  boomGain.gain.setValueAtTime(0.5, t);
+  boomGain.gain.exponentialRampToValueAtTime(0.001, t + 0.8);
+  boom.connect(boomGain);
+  boomGain.connect(masterGain);
+  boom.start(t);
+  boom.stop(t + 1.0);
+}
+
+function playFlareSound() {
+  if (!audioCtx) return;
+  const t = audioCtx.currentTime;
+
+  // Whoosh sound
+  const osc = audioCtx.createOscillator();
+  osc.type = 'sawtooth';
+  osc.frequency.setValueAtTime(800, t);
+  osc.frequency.exponentialRampToValueAtTime(200, t + 0.3);
+  const g = audioCtx.createGain();
+  g.gain.setValueAtTime(0.2, t);
+  g.gain.exponentialRampToValueAtTime(0.001, t + 0.3);
+  const filter = audioCtx.createBiquadFilter();
+  filter.type = 'bandpass';
+  filter.frequency.value = 1000;
+  filter.Q.value = 1;
+  osc.connect(filter);
+  filter.connect(g);
+  g.connect(masterGain);
+  osc.start(t);
+  osc.stop(t + 0.4);
+
+  // Add noise component
+  const buf = audioCtx.createBuffer(1, audioCtx.sampleRate * 0.3, audioCtx.sampleRate);
+  const d = buf.getChannelData(0);
+  for (let i = 0; i < d.length; i++) d[i] = (Math.random() * 2 - 1) * Math.exp(-i / (audioCtx.sampleRate * 0.1));
+  const ns = audioCtx.createBufferSource();
+  ns.buffer = buf;
+  const ng = audioCtx.createGain();
+  ng.gain.setValueAtTime(0.15, t);
+  ng.gain.exponentialRampToValueAtTime(0.001, t + 0.3);
+  ns.connect(ng);
+  ng.connect(masterGain);
+  ns.start(t);
+}
+
+function playBoostSound() {
+  if (!audioCtx) return;
+  const t = audioCtx.currentTime;
+
+  const osc = audioCtx.createOscillator();
+  osc.type = 'sawtooth';
+  osc.frequency.setValueAtTime(100, t);
+  osc.frequency.linearRampToValueAtTime(300, t + 0.15);
+  const g = audioCtx.createGain();
+  g.gain.setValueAtTime(0.2, t);
+  g.gain.exponentialRampToValueAtTime(0.05, t + 0.3);
+  g.gain.exponentialRampToValueAtTime(0.001, t + 0.6);
+  const filter = audioCtx.createBiquadFilter();
+  filter.type = 'lowpass';
+  filter.frequency.value = 600;
+  osc.connect(filter);
+  filter.connect(g);
+  g.connect(masterGain);
+  osc.start(t);
+  osc.stop(t + 0.7);
+}
+
+function playStallWarning() {
+  if (!audioCtx) return;
+  const t = audioCtx.currentTime;
+
+  const osc = audioCtx.createOscillator();
+  osc.type = 'square';
+  osc.frequency.value = 600;
+  const g = audioCtx.createGain();
+  g.gain.setValueAtTime(0.15, t);
+  g.gain.setValueAtTime(0, t + 0.1);
+  g.gain.setValueAtTime(0.15, t + 0.2);
+  g.gain.setValueAtTime(0, t + 0.3);
+  osc.connect(g);
+  g.connect(masterGain);
+  osc.start(t);
+  osc.stop(t + 0.35);
+}
+
+// ============================================================
 // INPUT
 // ============================================================
 
@@ -1463,6 +1854,7 @@ function onResize() {
 function startGame() {
   document.getElementById('start-screen').style.display = 'none';
   gameStarted = true;
+  initAudio();
   showMessage('Throttle up with W, then pull up with Down Arrow!', 4000);
 }
 
@@ -1485,9 +1877,11 @@ function updatePhysics(dt) {
   if (keys['s'] || keys['KeyS']) throttle = Math.max(0, throttle - dt * 0.8);
 
   // Boost: Shift
+  const wasBoost = boostActive;
   if ((keys['shift'] || keys['ShiftLeft'] || keys['ShiftRight']) && boostFuel > 0) {
     boostActive = true;
     boostFuel = Math.max(0, boostFuel - dt * 30);
+    if (!wasBoost) playBoostSound();
   } else {
     boostActive = false;
     boostFuel = Math.min(100, boostFuel + dt * 5);
@@ -1573,6 +1967,7 @@ function updatePhysics(dt) {
       crashed = true;
       showMessage('CRASHED! Press R to restart', 5000);
       createExplosion(airplane.position.clone());
+      playCrashSound();
     } else {
       airplane.position.y = minHeight;
     }
@@ -1604,6 +1999,7 @@ function updatePhysics(dt) {
       document.getElementById('score-val').textContent = score;
       showMessage('Ring collected! +1', 1500);
       createRingBurst(ring.position.clone());
+      playCollectSound();
 
       if (score >= ringTotal) {
         showMessage('ALL RINGS COLLECTED! You are a Sky Rider!', 5000);
@@ -1627,8 +2023,15 @@ function updatePhysics(dt) {
   // Fire flares
   if ((keys['f'] || keys['KeyF']) && !keys._fPrev) {
     fireFlare();
+    playFlareSound();
   }
   keys._fPrev = keys['f'] || keys['KeyF'];
+
+  // Audio toggle: M key
+  if ((keys['m'] || keys['KeyM']) && !keys._mPrev) {
+    toggleAudio();
+  }
+  keys._mPrev = keys['m'] || keys['KeyM'];
 
   // Update terrain chunks based on position
   updateTerrainChunks(airplane.position.x, airplane.position.z);
@@ -1782,9 +2185,14 @@ function updateHUD() {
   const agl = airplane.position.y - terrainH;
   const warningEl = document.getElementById('warning');
   if (agl < 15 && speed > 20 && !airplane_state.onGround) {
+    const prevFlash = warningFlash;
     warningFlash += 0.1;
     warningEl.style.opacity = Math.abs(Math.sin(warningFlash));
     warningEl.textContent = 'PULL UP! TERRAIN!';
+    // Play stall warning beep every ~1s
+    if (Math.floor(warningFlash) > Math.floor(prevFlash)) {
+      playStallWarning();
+    }
   } else {
     warningEl.style.opacity = 0;
     warningFlash = 0;
@@ -1803,6 +2211,8 @@ function animate() {
 
   updatePhysics(dt);
   updateCamera(dt);
+  processChunkQueue();
+  updateAudio(dt);
 
   // Animate clouds - recycle relative to player
   clouds.forEach(c => {
